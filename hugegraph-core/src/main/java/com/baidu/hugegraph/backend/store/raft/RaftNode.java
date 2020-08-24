@@ -26,6 +26,7 @@ import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 
 import org.slf4j.Logger;
 
@@ -45,6 +46,8 @@ import com.alipay.sofa.jraft.rpc.RpcServer;
 import com.alipay.sofa.jraft.util.BytesUtil;
 import com.alipay.sofa.jraft.util.Endpoint;
 import com.baidu.hugegraph.backend.BackendException;
+import com.baidu.hugegraph.backend.store.raft.RaftRequests.SetLeaderRequest;
+import com.baidu.hugegraph.backend.store.raft.RaftRequests.SetLeaderResponse;
 import com.baidu.hugegraph.backend.store.raft.RaftRequests.StoreCommandRequest;
 import com.baidu.hugegraph.backend.store.raft.RaftRequests.StoreCommandResponse;
 import com.baidu.hugegraph.util.CodeUtil;
@@ -60,6 +63,7 @@ public class RaftNode {
     private final RaftSharedContext context;
     private final Node node;
     private final StoreStateMachine stateMachine;
+    private final AtomicLong leaderTerm;
 
     private final Object electedLock;
     private volatile boolean elected;
@@ -75,6 +79,7 @@ public class RaftNode {
             throw new BackendException("Failed to init raft node", e);
         }
         this.node.addReplicatorStateListener(new RaftNodeStateListener());
+        this.leaderTerm = new AtomicLong(-1);
         this.electedLock = new Object();
         this.elected = false;
         this.started = false;
@@ -97,12 +102,63 @@ public class RaftNode {
         return this.node.getLeaderId();
     }
 
-    public boolean isLeader() {
-        return this.node.isLeader();
+    public boolean isRaftLeader() {
+        return this.leaderTerm.get() > 0;
+    }
+
+    public void leaderTerm(long term) {
+        this.leaderTerm.set(term);
     }
 
     public void shutdown() {
         this.node.shutdown();
+    }
+
+    public void transferLeaderTo(PeerId peerId) {
+        Status status = this.node.transferLeadershipTo(peerId);
+        if (!status.isOk()) {
+            throw new BackendException("Failed to transafer leader to '%s', " +
+                                       "raft error : %s",
+                                       peerId, status.getErrorMsg());
+        }
+    }
+
+    public void setLeader(PeerId newLeaderId) {
+        // No need to re-elect if already is new leader
+        if (this.node.getLeaderId().equals(newLeaderId)) {
+            return;
+        }
+        if (this.isRaftLeader()) {
+            // If current node is the leader, transfer directly
+            this.transferLeaderTo(newLeaderId);
+        } else {
+            // If current node is not leader, forward request to leader
+            String endpoint = newLeaderId.toString();
+            SetLeaderRequest request = SetLeaderRequest.newBuilder()
+                                                       .setEndpoint(endpoint)
+                                                       .build();
+            RaftClosure future = new RaftClosure();
+            this.forwardToLeader(request, future);
+            try {
+                future.waitFinished();
+            } catch (RuntimeException e) {
+                throw e;
+            } catch (Throwable t) {
+                throw new BackendException(t);
+            }
+        }
+    }
+
+    public void removePeer(PeerId peerId) {
+        RaftClosure future = new RaftClosure();
+        this.node.removePeer(peerId, future);
+        try {
+            future.waitFinished();
+        } catch (RuntimeException e) {
+            throw e;
+        } catch (Throwable t) {
+            throw new BackendException(t);
+        }
     }
 
     private Node initRaftNode() throws IOException {
@@ -124,7 +180,7 @@ public class RaftNode {
         // Wait leader elected
         this.waitLeaderElected(RaftSharedContext.NO_TIMEOUT);
 
-        if (!this.node.isLeader()) {
+        if (!this.isRaftLeader()) {
             this.forwardToLeader(command, closure);
             return;
         }
@@ -255,7 +311,7 @@ public class RaftNode {
     }
 
     private void forwardToLeader(StoreCommand command, StoreClosure closure) {
-        assert !this.node.isLeader();
+        assert !this.isRaftLeader();
         PeerId leaderId = this.node.getLeaderId();
         E.checkNotNull(leaderId, "leader id");
         LOG.debug("The node {} forward request to leader {}",
@@ -288,6 +344,39 @@ public class RaftNode {
             @Override
             public void run(Status status) {
                 closure.run(status);
+            }
+        };
+        this.waitRpc(leaderId.getEndpoint(), request, responseClosure);
+    }
+
+    private void forwardToLeader(SetLeaderRequest request, RaftClosure future) {
+        assert !this.node.isLeader();
+        PeerId leaderId = this.node.getLeaderId();
+        E.checkNotNull(leaderId, "leader id");
+        LOG.debug("The node {} forward request to leader {}",
+                  this.node.getNodeId(), leaderId);
+
+        RpcResponseClosure<SetLeaderResponse> responseClosure;
+        responseClosure = new RpcResponseClosure<SetLeaderResponse>() {
+            @Override
+            public void setResponse(SetLeaderResponse resp) {
+                if (resp.getStatus()) {
+                    LOG.debug("SetLeaderResponse status ok");
+                    future.complete(Status.OK(), () -> null);
+                } else {
+                    LOG.debug("SetLeaderResponse status error");
+                    Status status = new Status(RaftError.UNKNOWN,
+                                               "fowared request failed");
+                    future.failure(status, new BackendException(
+                                   "Current node isn't leader, leader is " +
+                                   "[%s], failed to forward request to " +
+                                   "leader: %s", leaderId, resp.getMessage()));
+                }
+            }
+
+            @Override
+            public void run(Status status) {
+                future.run(status);
             }
         };
         this.waitRpc(leaderId.getEndpoint(), request, responseClosure);

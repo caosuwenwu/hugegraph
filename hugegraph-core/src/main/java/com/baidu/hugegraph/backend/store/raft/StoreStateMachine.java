@@ -103,7 +103,7 @@ public class StoreStateMachine extends StateMachineAdapter {
 
     private void updateCacheIfNeeded(BackendMutation mutation) {
         // Only follower need to update cache from store to tx
-        if (this.node().isLeader()) {
+        if (this.node().isRaftLeader()) {
             return;
         }
         for (HugeType type : mutation.types()) {
@@ -125,7 +125,7 @@ public class StoreStateMachine extends StateMachineAdapter {
 
     @Override
     public void onApply(Iterator iter) {
-        LOG.debug("Node role: {}", this.node().isLeader() ?
+        LOG.debug("Node role: {}", this.node().isRaftLeader() ?
                                    "leader" : "follower");
         StoreClosure closure = null;
         try {
@@ -198,7 +198,7 @@ public class StoreStateMachine extends StateMachineAdapter {
 
     @Override
     public boolean onSnapshotLoad(SnapshotReader reader) {
-        if (this.node().isLeader()) {
+        if (this.node().isRaftLeader()) {
             LOG.warn("Leader is not supposed to load snapshot.");
             return false;
         }
@@ -214,6 +214,7 @@ public class StoreStateMachine extends StateMachineAdapter {
     @Override
     public void onLeaderStart(long term) {
         LOG.info("The node {} become to leader", this.node().nodeId());
+        this.node().leaderTerm(term);
         this.node().onElected(true);
         super.onLeaderStart(term);
     }
@@ -221,6 +222,7 @@ public class StoreStateMachine extends StateMachineAdapter {
     @Override
     public void onLeaderStop(Status status) {
         LOG.info("The node {} abdicated from leader", this.node().nodeId());
+        this.node().leaderTerm(-1);
         this.node().onElected(false);
         super.onLeaderStop(status);
     }
