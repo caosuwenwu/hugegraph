@@ -477,4 +477,12 @@ public class CoreOptions extends OptionHolder {
                     disallowEmpty(),
                     "./conf/computer.yaml"
             );
+
+    public static final ConfigOption<Integer> OLTP_CONCURRENT_THREADS =
+            new ConfigOption<>(
+                    "oltp.concurrent.threads",
+                    "Thread number to concurrently execute oltp algorithm.",
+                    rangeInt(0, 200),
+                    10
+            );
 }
